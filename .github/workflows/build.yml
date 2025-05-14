@@ -1,10 +1,10 @@
 name: Build
 on:
   workflow_dispatch:
-      inputs:
-        package_name:
-          description: "Package name of the game:"
-          required: true
+    inputs:
+      package_name:
+        description: "Package name of the game (used for module description):" # Actualizado para clarificar uso
+        required: true
 
 jobs:
   build:
@@ -14,14 +14,25 @@ jobs:
     - uses: actions/setup-java@v3
       with:
         distribution: temurin
-        java-version: 11
+        java-version: 11 # Asegúrate que esta versión de Java es compatible con tu Gradle
         cache: gradle
-    - run: |
-        chmod +x ./gradlew
-        sed -i 's/moduleDescription = "/moduleDescription = "(${{ github.event.inputs.package_name }}) /g' module.gradle
-        sed -i "s/com.game.packagename/${{ github.event.inputs.package_name }}/g" module/src/main/cpp/game.h
-        ./gradlew :module:assembleRelease
-    - uses: actions/upload-artifact@v3
+    - name: Set up NDK
+      uses: nttld/setup-ndk@v1
       with:
-        name: zygisk-il2cppdumper
-        path: out/magisk_module_release/
+        # ndk-version: r23b # <--- ESTA LÍNEA SE ELIMINA para usar la versión predeterminada de la acción
+        add-to-path: true
+    - name: Grant execute permission for gradlew
+      run: chmod +x ./gradlew
+    - name: Configure module and build
+      run: |
+        # La descripción del módulo aún se puede personalizar.
+        # El nombre del paquete en game.h ya no se modifica aquí.
+        sed -i 's/moduleDescription = "/moduleDescription = "(${{ github.event.inputs.package_name }}) /g' module.gradle
+        ./gradlew :module:assembleRelease
+    - uses: actions/upload-artifact@v4
+      with:
+        name: zygisk-il2cppdumper-${{ github.event.inputs.package_name }} # Artefacto nombrado con el package_name
+        path: out/magisk_module_release/ # Ruta común para el módulo Magisk construido con https://github.com/topjohnwu/magisk-module-template
+        # Verifica la ruta correcta de salida de tu artefacto .zip del módulo Magisk.
+        # Si tu estructura de proyecto es diferente, ajusta la ruta.
+        # El path original 'out/magisk_module_release/' podría ser correcto si tu Gradle lo configura así.
