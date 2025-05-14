@@ -16,11 +16,6 @@ jobs:
         distribution: temurin
         java-version: 11 # Asegúrate que esta versión de Java es compatible con tu Gradle
         cache: gradle
-    - name: Set up NDK
-      uses: nttld/setup-ndk@v1
-      with:
-        # ndk-version: r23b # <--- ESTA LÍNEA SE ELIMINA para usar la versión predeterminada de la acción
-        add-to-path: true
     - name: Grant execute permission for gradlew
       run: chmod +x ./gradlew
     - name: Configure module and build
