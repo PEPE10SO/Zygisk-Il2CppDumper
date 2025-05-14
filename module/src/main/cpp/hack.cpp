@@ -167,7 +167,7 @@ struct NativeBridgeCallbacks {
     void *isCompatibleWith;
     void *getSignalHandler;
     void *unloadLibrary;
-    void *getError;
+    const char* (*getError)(); // <--- CORREGIDO AQUÍ
     void *isPathSupported;
     void *initAnonymousNamespace;
     void *createNamespace;
@@ -249,9 +249,11 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *arm_so_dat
         auto callbacks = (NativeBridgeCallbacks *) dlsym(nb_handle, "NativeBridgeItf");
         if (callbacks) {
             LOGI("NativeBridgeItf found. Version: %u", callbacks->version);
-            LOGI("NativeBridgeLoadLibrary: %p", callbacks->loadLibrary);
-            LOGI("NativeBridgeLoadLibraryExt: %p", callbacks->loadLibraryExt);
-            LOGI("NativeBridgeGetTrampoline: %p", callbacks->getTrampoline);
+            LOGI("NativeBridgeLoadLibrary: %p", (void*)callbacks->loadLibrary);
+            LOGI("NativeBridgeLoadLibraryExt: %p", (void*)callbacks->loadLibraryExt);
+            LOGI("NativeBridgeGetTrampoline: %p", (void*)callbacks->getTrampoline);
+            LOGI("NativeBridgeGetError: %p", (void*)callbacks->getError);
+
 
             // Crear un memfd para pasar la librería ARM.
             int fd = syscall(__NR_memfd_create, "anon_arm_so", MFD_CLOEXEC);
@@ -290,13 +292,6 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *arm_so_dat
             void *arm_helper_handle = nullptr;
             if (api_level >= 26 && callbacks->loadLibraryExt) { // Android O (API 26) y superior
                 LOGI("Using NativeBridgeLoadLibraryExt (namespace 3 - CLASSPATH_SHARED_NAMESPACE).");
-                // El namespace 3 (APP_NAMESPACE_SHARED) es una suposición común para bibliotecas compartidas por classloader.
-                // Documentación oficial sobre los namespaces de NativeBridge es escasa.
-                // android_namespace_t* ns = (android_namespace_t*)3; // Esto es conceptual, el valor exacto puede variar o ser específico del puente.
-                // El código original usa (void*)3, lo cual podría ser un índice o un tipo de namespace.
-                // Si esto falla, podría ser necesario investigar qué valor de namespace es apropiado.
-                // Para mayor seguridad, probar primero con nullptr si es posible.
-                // Sin embargo, el código original usa `(void *) 3`.
                 arm_helper_handle = callbacks->loadLibraryExt(path, RTLD_NOW, (void *) 3);
                  if (!arm_helper_handle && callbacks->loadLibrary) { // Fallback si loadLibraryExt falla o no es el adecuado
                     LOGW("NativeBridgeLoadLibraryExt failed or returned null. Trying loadLibrary.");
@@ -317,7 +312,7 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *arm_so_dat
                                                                                            "JNI_OnLoad",
                                                                                            nullptr, 0);
                 if (init_arm_lib) {
-                    LOGI("JNI_OnLoad trampoline obtained from ARM helper .so: %p", init_arm_lib);
+                    LOGI("JNI_OnLoad trampoline obtained from ARM helper .so: %p", (void*)init_arm_lib);
                     // Llamar a JNI_OnLoad de la librería ARM.
                     // El segundo argumento `reserved` se usa para pasar `game_data_dir`.
                     jint onload_result = init_arm_lib(vms, (void *) game_data_dir);
@@ -334,13 +329,16 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *arm_so_dat
                     // close(fd) se puede hacer aquí si dlopen lo maneja bien.
                     // Generalmente, el fd se puede cerrar después de dlopen si el kernel lo permite para /proc/self/fd.
                     close(fd);
+                    // dlclose(nb_handle); // Puedes cerrar el handle del puente si ya no lo necesitas
                     return true; // El hack ARM está en camino.
                 } else {
                     LOGE("Failed to get JNI_OnLoad trampoline from ARM helper .so.");
                     // callbacks->unloadLibrary(arm_helper_handle); // Si es necesario.
                 }
             } else {
-                LOGE("Failed to load ARM helper .so via NativeBridge from path: %s. Error (if any from bridge): %s", path, callbacks->getError ? (const char*)callbacks->getError() : "N/A");
+                // CORREGIDO: Uso de callbacks->getError como función si no es nulo
+                LOGE("Failed to load ARM helper .so via NativeBridge from path: %s. Error (if any from bridge): %s",
+                     path, (callbacks->getError && callbacks->getError()) ? callbacks->getError() : "N/A");
             }
             close(fd); // Cerrar el fd en caso de fallo después de crearlo.
         } else {
