@@ -13,7 +13,7 @@ jobs:
     - uses: actions/checkout@v3
     - uses: actions/setup-java@v3
       with:
-        distribution: adopt
+        distribution: temurin
         java-version: 11 # Asegúrate que esta versión de Java es compatible con tu Gradle
         cache: gradle
     - name: Grant execute permission for gradlew
