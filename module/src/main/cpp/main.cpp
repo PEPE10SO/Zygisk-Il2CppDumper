@@ -8,7 +8,7 @@
 #include <cinttypes>
 #include <string> // Para std::string y strlen
 #include <cerrno> // Para strerror
-#include <dirent.h> // Para opendir, readdir, closedir
+#include <vector> // Para la lista de prefijos
 
 #include "hack.h"
 #include "zygisk.hpp"
@@ -30,7 +30,6 @@ public:
             delete[] game_data_dir;
             game_data_dir = nullptr;
         }
-        // Si arm_so_data fue mapeado y no transferido/consumido, se debe liberar.
         if (arm_so_data && arm_so_length > 0) {
             LOGD("MyModule destructor: munmap'ing arm_so_data that was not consumed.");
             munmap(arm_so_data, arm_so_length);
@@ -63,7 +62,7 @@ public:
             processPreSpecialize(current_package_name_utf, current_app_data_dir_utf);
         } else {
             LOGE("Failed to get package name or app data directory.");
-            enable_hack = false; // No se puede proceder sin esta información.
+            enable_hack = false;
         }
 
         if (current_package_name_utf) {
@@ -77,17 +76,12 @@ public:
     void postAppSpecialize(const AppSpecializeArgs *) override {
         if (enable_hack && game_data_dir) {
             LOGI("Preparing hack for: %s", game_data_dir);
-            // Pasamos los datos del .so ARM si estamos en x86 y se mapearon correctamente.
             std::thread hack_thread(hack_prepare, game_data_dir, arm_so_data, arm_so_length);
             hack_thread.detach();
-            // Una vez pasados a hack_prepare, la responsabilidad de arm_so_data (munmap)
-            // recae en NativeBridgeLoad o el consumidor final.
-            // Anulamos los punteros aquí para indicar que la propiedad se ha transferido.
             arm_so_data = nullptr;
             arm_so_length = 0;
         } else {
-            LOGI("Hack not enabled or game_data_dir not set for this process (or libil2cpp.so not found).");
-            // Si arm_so_data fue mapeado pero el hack no se ejecutará, liberarlo.
+            LOGI("Hack not enabled or game_data_dir not set for this process.");
             if (arm_so_data && arm_so_length > 0) {
                 LOGD("postAppSpecialize: munmap'ing arm_so_data because hack is not enabled.");
                 munmap(arm_so_data, arm_so_length);
@@ -101,60 +95,42 @@ private:
     Api *api;
     JNIEnv *env;
     bool enable_hack;
-    char *game_data_dir; // Almacena el app_data_dir del proceso actual
-    void *arm_so_data;   // Datos mapeados del .so ARM auxiliar en x86
+    char *game_data_dir;
+    void *arm_so_data;
     size_t arm_so_length;
 
-    // Función auxiliar para verificar si libil2cpp.so existe en el directorio de librerías.
-    bool doesLibIl2CppExist(const char* app_data_dir) {
-        if (!app_data_dir) return false;
-
-        std::string lib_path_base = std::string(app_data_dir) + "/lib/";
-
-        // Intentar encontrar en subdirectorios ABI (arm, arm64, x86, x86_64)
-        const char* abis[] = {"arm", "arm64", "x86", "x86_64", nullptr};
-        for (int i = 0; abis[i] != nullptr; ++i) {
-            std::string current_lib_dir = lib_path_base + abis[i] + "/";
-            DIR *dir = opendir(current_lib_dir.c_str());
-            if (dir) {
-                struct dirent *entry;
-                while ((entry = readdir(dir)) != nullptr) {
-                    if (strcmp(entry->d_name, "libil2cpp.so") == 0) {
-                        closedir(dir);
-                        LOGI("Found libil2cpp.so in: %s%s", current_lib_dir.c_str(), entry->d_name);
-                        return true;
-                    }
-                }
-                closedir(dir);
+    void processPreSpecialize(const char *current_package_name, const char *current_app_data_dir) {
+        LOGI("Zygisk Il2Cpp Dumper checking package: %s", current_package_name);
+        
+        // Lista de prefijos de paquetes comunes que no son juegos
+        static const std::vector<std::string> system_prefixes = {
+            "com.google.",
+            "com.android.",
+            "android.",
+            "com.qualcomm.",
+            "androidx."
+        };
+        
+        // Verificar si es una aplicación del sistema
+        for (const auto& prefix : system_prefixes) {
+            if (strncmp(current_package_name, prefix.c_str(), prefix.length()) == 0) {
+                LOGI("Skipping system package: %s", current_package_name);
+                enable_hack = false;
+                return;
             }
         }
         
-        // También intentar en el directorio base si alguna app lo pone ahí (menos común)
-        std::string direct_lib_path = lib_path_base + "libil2cpp.so";
-        if (access(direct_lib_path.c_str(), F_OK) == 0) {
-            LOGI("Found libil2cpp.so directly in: %s", direct_lib_path.c_str());
-            return true;
-        }
-
-        LOGD("libil2cpp.so not found for package with app_data_dir: %s", app_data_dir);
-        return false;
-    }
-
-    void processPreSpecialize(const char *current_package_name, const char *current_app_data_dir) {
-        LOGI("Zygisk Il2Cpp Dumper processing package: %s", current_package_name);
-
-        // Primero, verificar si libil2cpp.so existe en el directorio de la aplicación.
-        // Si no existe, no hay necesidad de habilitar el hack para esta app.
-        if (!doesLibIl2CppExist(current_app_data_dir)) {
+        // Verificar si existe libil2cpp.so en el directorio de la aplicación
+        std::string lib_path = std::string(current_app_data_dir) + "/lib/libil2cpp.so";
+        if (access(lib_path.c_str(), F_OK) == -1) {
+            LOGI("libil2cpp.so not found in %s, skipping hack", lib_path.c_str());
             enable_hack = false;
-            LOGI("Package %s does not contain libil2cpp.so. Skipping hack.", current_package_name);
-            return; // Salir temprano, no se necesita más procesamiento para esta app.
+            return;
         }
-
-        // Si libil2cpp.so existe, entonces enable_hack se mantiene true.
+        
+        // Si llegamos aquí, activar el hack
         enable_hack = true;
-        LOGI("libil2cpp.so found for package: %s. Activating hack.", current_package_name);
-
+        
         // Gestionar game_data_dir
         if (this->game_data_dir) {
             delete[] this->game_data_dir;
