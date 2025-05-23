@@ -29,32 +29,24 @@ void hack_start(const char *game_data_dir) {
         return;
     }
 
-    // Primero verificar si libil2cpp.so existe en el directorio de la aplicación
-    std::string lib_path = std::string(game_data_dir) + "/lib/libil2cpp.so";
-    if (access(lib_path.c_str(), F_OK) == -1) {
-        LOGI("libil2cpp.so not found in app directory, skipping hack");
-        return;
-    }
-
     bool load = false;
-    // Solo 2 intentos máximo
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 10; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
             LOGI("libil2cpp.so loaded successfully at try %d. Handle: %p", i + 1, handle);
             load = true;
-            il2cpp_api_init(handle);
+            il2cpp_api_init(handle); // il2cpp_api_init ya contiene la lógica de inicialización y obtención de la base.
             il2cpp_dump(game_data_dir);
+            // xdl_close(handle); // Considerar si cerrar el handle aquí o dejarlo para el sistema.
+            // Si il2cpp_dump usa funciones de la librería después de la inicialización, no cerrar.
             break;
         } else {
-            LOGW("Failed to load libil2cpp.so at try %d", i + 1);
-            if (i < 1) { // Solo esperar si no es el último intento
-                sleep(1);
-            }
+            LOGW("Failed to load libil2cpp.so at try %d. Waiting 1 second.", i + 1);
+            sleep(1);
         }
     }
     if (!load) {
-        LOGW("libil2cpp.so not found after 2 tries in thread %d", gettid());
+        LOGE("libil2cpp.so not found after 10 tries in thread %d.", gettid());
     }
 }
 
