@@ -1,26 +1,3 @@
-// Copyright (c) 2020-2021 Perfare
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-//
-
-// Created by Perfare on 2020/7/4.
-
 #include "hack.h"
 #include "il2cpp_dump.h"
 #include "log.h"
@@ -293,7 +270,7 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *arm_so_dat
             if (api_level >= 26 && callbacks->loadLibraryExt) { // Android O (API 26) y superior
                 LOGI("Using NativeBridgeLoadLibraryExt (namespace 3 - CLASSPATH_SHARED_NAMESPACE).");
                 arm_helper_handle = callbacks->loadLibraryExt(path, RTLD_NOW, (void *) 3);
-                if (!arm_helper_handle && callbacks->loadLibrary) { // Fallback si loadLibraryExt falla o no es el adecuado
+                 if (!arm_helper_handle && callbacks->loadLibrary) { // Fallback si loadLibraryExt falla o no es el adecuado
                     LOGW("NativeBridgeLoadLibraryExt failed or returned null. Trying loadLibrary.");
                     arm_helper_handle = callbacks->loadLibrary(path, RTLD_NOW);
                 }
@@ -301,8 +278,9 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *arm_so_dat
                 LOGI("Using NativeBridgeLoadLibrary.");
                 arm_helper_handle = callbacks->loadLibrary(path, RTLD_NOW);
             } else {
-                LOGE("No suitable NativeBridge load function found in callbacks.");
+                 LOGE("No suitable NativeBridge load function found in callbacks.");
             }
+
 
             if (arm_helper_handle) {
                 LOGI("ARM helper .so loaded successfully via NativeBridge. Handle: %p", arm_helper_handle);
@@ -318,11 +296,24 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *arm_so_dat
                     LOGI("JNI_OnLoad for ARM helper .so returned: %d", onload_result);
                     if (onload_result == JNI_ERR) {
                         LOGE("JNI_OnLoad in ARM helper .so indicated an error.");
+                        // Considerar si se debe cerrar el handle de la librería ARM o no.
+                        // callbacks->unloadLibrary(arm_helper_handle); // Si está disponible y es seguro.
                     }
+                    // No cerrar fd aquí, dlopen mantiene una referencia. Se cerrará cuando el proceso termine o la librería sea descargada.
+                    // dlclose(nb_handle); // No cierres el handle del puente aquí si otras partes aún lo necesitan.
+                    // La librería ARM ahora está cargada y su JNI_OnLoad ha sido llamado.
+                    // Esto significa que el hack_start dentro de la librería ARM se habrá iniciado.
+                    // close(fd) se puede hacer aquí si dlopen lo maneja bien.
+                    // Generalmente, el fd se puede cerrar después de dlopen si el kernel lo permite para /proc/self/fd.
+                    close(fd);
+                    // dlclose(nb_handle); // Puedes cerrar el handle del puente si ya no lo necesitas
+                    return true; // El hack ARM está en camino.
                 } else {
                     LOGE("Failed to get JNI_OnLoad trampoline from ARM helper .so.");
+                    // callbacks->unloadLibrary(arm_helper_handle); // Si es necesario.
                 }
             } else {
+                // CORREGIDO: Uso de callbacks->getError como función si no es nulo
                 LOGE("Failed to load ARM helper .so via NativeBridge from path: %s. Error (if any from bridge): %s",
                      path, (callbacks->getError && callbacks->getError()) ? callbacks->getError() : "N/A");
             }
@@ -334,6 +325,8 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *arm_so_dat
     } else {
         LOGW("Native bridge library (e.g., libhoudini.so) not found or failed to load: %s", dlerror());
     }
+    // Si llegamos aquí, NativeBridgeLoad falló o no fue aplicable.
+    // munmap(arm_so_data_param, arm_so_length_param); // Ya se hace al principio o en los return false.
     return false; // Indica que el hack_start principal (x86) debe continuar.
 }
 
@@ -341,23 +334,44 @@ void hack_prepare(const char *game_data_dir_param, void *arm_so_data_param, size
     LOGI("hack_prepare started in thread: %d", gettid());
     if (!game_data_dir_param) {
         LOGE("game_data_dir_param is null in hack_prepare. Aborting.");
+        // Si arm_so_data_param fue mapeado y no se va a usar, liberarlo.
+        if (arm_so_data_param && arm_so_length_param > 0) {
+             LOGD("Munmap'ing arm_so_data_param in hack_prepare due to null game_data_dir_param.");
+             munmap(arm_so_data_param, arm_so_length_param);
+        }
         return;
     }
 
-    // Comprobar si libil2cpp.so está disponible
-    void *handle = xdl_open("libil2cpp.so", 0);
-    if (!handle) {
-        // Si no está disponible, esperar indefinidamente sin hacer nada
-        while (true) {
-            // No hacer nada, solo esperar
-            sleep(1); // Puedes ajustar el tiempo de espera si es necesario
-        }
-    }
+    int api_level = android_get_device_api_level();
+    LOGI("Device API level: %d", api_level);
+    LOGI("Game data dir received in hack_prepare: %s", game_data_dir_param);
+    LOGI("ARM SO data: %p, length: %zu", arm_so_data_param, arm_so_length_param);
 
-    // Si se carga con éxito
-    LOGI("libil2cpp.so loaded successfully.");
-    il2cpp_api_init(handle);
-    il2cpp_dump(game_data_dir_param);
+#if defined(__i386__) || defined(__x86_64__)
+    LOGI("Running on x86/x86_64. Will attempt NativeBridgeLoad.");
+    // En x86/x86_64, arm_so_data_param y arm_so_length_param son para la librería .so ARM auxiliar.
+    if (arm_so_data_param && arm_so_length_param > 0) {
+        if (!NativeBridgeLoad(game_data_dir_param, api_level, arm_so_data_param, arm_so_length_param)) {
+            // NativeBridgeLoad falló, o no fue necesario (p.ej., juego x86 nativo), o ya liberó arm_so_data_param.
+            LOGI("NativeBridgeLoad returned false or was not applicable. Attempting direct hack_start for %s.", game_data_dir_param);
+            hack_start(game_data_dir_param); // Intentar el hack directamente (para juegos x86).
+        }
+        // Si NativeBridgeLoad tuvo éxito, cargó la librería ARM, y esa librería llamó a su propio hack_start.
+        // arm_so_data_param ya fue liberado (munmap) por NativeBridgeLoad.
+    } else {
+        LOGW("No ARM helper library data provided for x86/x86_64, or mmap failed earlier. Attempting direct hack_start for %s.", game_data_dir_param);
+        hack_start(game_data_dir_param); // Fallback si no hay datos del .so auxiliar.
+    }
+#else
+    // En arquitecturas ARM, hack_prepare llama directamente a hack_start.
+    // arm_so_data_param y arm_so_length_param no se usan aquí (deberían ser nullptr/0).
+    LOGI("Running on ARM. Calling hack_start directly for %s.", game_data_dir_param);
+    if (arm_so_data_param && arm_so_length_param > 0) {
+        LOGW("arm_so_data_param is unexpectedly non-null on ARM. Munmap'ing to prevent leak.");
+        munmap(arm_so_data_param, arm_so_length_param); // No debería ocurrir, pero por si acaso.
+    }
+    hack_start(game_data_dir_param);
+#endif
     LOGI("hack_prepare finished for %s.", game_data_dir_param);
 }
 
@@ -367,7 +381,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     // 'reserved' se espera que sea const char* game_data_dir
     const char *game_data_dir = (const char *) reserved;
     LOGI("JNI_OnLoad (ARM helper library) called. Game data dir: %s", game_data_dir ? game_data_dir : "null");
-
+    
     if (!vm) {
         LOGE("JNI_OnLoad (ARM helper): JavaVM is null!");
         return JNI_ERR;
