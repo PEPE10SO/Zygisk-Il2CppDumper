@@ -31,9 +31,8 @@ public:
             delete[] game_data_dir;
             game_data_dir = nullptr;
         }
-        // Si arm_so_data fue mapeado y no transferido/consumido, se debe liberar.
         if (arm_so_data && arm_so_length > 0) {
-            LOGD("MyModule destructor: munmap'ing arm_so_data that was not consumed.");
+            LOGD("MyModule destructor: munmap'ing arm_so_data that was not consumed or cleaned up earlier.");
             munmap(arm_so_data, arm_so_length);
             arm_so_data = nullptr;
             arm_so_length = 0;
@@ -42,11 +41,24 @@ public:
 
     void onLoad(Api *api, JNIEnv *env) override {
         this->api = api;
-        this->env = env;
+        this->env = env; // Guardamos el JNIEnv proporcionado por Zygisk
         LOGI("MyModule onLoad completed.");
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
+        // Reiniciar el estado para la especialización de esta app
+        this->enable_hack = false;
+        if (this->game_data_dir) {
+            delete[] this->game_data_dir;
+            this->game_data_dir = nullptr;
+        }
+        // Si arm_so_data fue mapeado previamente y no limpiado (ej. hack no habilitado en postAppSpecialize)
+        if (this->arm_so_data && this->arm_so_length > 0) {
+            munmap(this->arm_so_data, this->arm_so_length);
+            this->arm_so_data = nullptr;
+            this->arm_so_length = 0;
+        }
+
         auto current_package_name_jstr = args->nice_name;
         auto current_app_data_dir_jstr = args->app_data_dir;
 
@@ -56,15 +68,79 @@ public:
         if (current_package_name_jstr) {
             current_package_name_utf = env->GetStringUTFChars(current_package_name_jstr, nullptr);
         }
-        if (current_app_data_dir_jstr) {
+        // app_data_dir también se necesita si el hack se habilita
+        if (current_app_data_dir_jstr && current_package_name_utf) { // Solo obtener si el package name también está disponible
             current_app_data_dir_utf = env->GetStringUTFChars(current_app_data_dir_jstr, nullptr);
         }
 
-        if (current_package_name_utf && current_app_data_dir_utf) {
-            processPreSpecialize(current_package_name_utf, current_app_data_dir_utf);
+
+        if (current_package_name_utf) {
+            LOGI("Zygisk Il2Cpp Dumper evaluating package: %s", current_package_name_utf);
+
+            if (hasIl2CppLibrary(current_package_name_utf)) { // Pasamos el nombre del paquete para logging
+                LOGI("libil2cpp.so check positive for %s. Enabling dumper.", current_package_name_utf);
+                this->enable_hack = true;
+
+                if (current_app_data_dir_utf) {
+                    size_t app_data_dir_len = strlen(current_app_data_dir_utf);
+                    this->game_data_dir = new char[app_data_dir_len + 1];
+                    strcpy(this->game_data_dir, current_app_data_dir_utf);
+                    this->game_data_dir[app_data_dir_len] = '\0';
+                    LOGI("Game data directory set to: %s", this->game_data_dir);
+                } else {
+                    LOGE("App data directory is null for %s, but libil2cpp.so was detected. Disabling hack.", current_package_name_utf);
+                    this->enable_hack = false; // Necesitamos app_data_dir
+                }
+
+                // Solo proceder con la carga del helper ARM si el hack está habilitado
+                if (this->enable_hack) {
+#if defined(__i386__) || defined(__x86_64__)
+                    const char* path = nullptr;
+#if defined(__i386__)
+                    path = "zygisk/armeabi-v7a.so";
+                    LOGI("Targeting armeabi-v7a helper for x86.");
+#elif defined(__x86_64__)
+                    path = "zygisk/arm64-v8a.so";
+                    LOGI("Targeting arm64-v8a helper for x86_64.");
+#endif
+                    int dirfd = api->getModuleDir();
+                    if (dirfd != -1) {
+                        int fd = openat(dirfd, path, O_RDONLY);
+                        if (fd != -1) {
+                            struct stat sb{};
+                            if (fstat(fd, &sb) == 0) {
+                                arm_so_length = sb.st_size;
+                                if (arm_so_length > 0) {
+                                    arm_so_data = mmap(nullptr, arm_so_length, PROT_READ, MAP_PRIVATE, fd, 0);
+                                    if (arm_so_data == MAP_FAILED) {
+                                        LOGE("mmap failed for %s: %s. Disabling hack.", path, strerror(errno));
+                                        arm_so_data = nullptr;
+                                        arm_so_length = 0;
+                                        this->enable_hack = false; // Error crítico
+                                    } else {
+                                        LOGI("Successfully mmap'd helper library %s, size %zu", path, arm_so_length);
+                                    }
+                                } else { LOGW("Helper library %s is empty.", path); arm_so_data = nullptr; arm_so_length = 0; }
+                            } else { LOGE("fstat failed for %s: %s", path, strerror(errno)); arm_so_data = nullptr; arm_so_length = 0; }
+                            close(fd);
+                        } else { LOGW("Unable to open ARM helper library %s: %s", path, strerror(errno)); arm_so_data = nullptr; arm_so_length = 0; }
+                    } else { LOGE("Failed to get module directory descriptor."); arm_so_data = nullptr; arm_so_length = 0; }
+#else
+                    LOGI("Running on ARM architecture. No helper .so mmap needed in main module.");
+                    arm_so_data = nullptr;
+                    arm_so_length = 0;
+#endif
+                }
+            } else {
+                LOGI("libil2cpp.so NOT detected for %s. Dumper will remain inactive.", current_package_name_utf);
+                this->enable_hack = false; // Asegurar que está deshabilitado
+                // Asegurar que los recursos del helper ARM no queden mapeados si no se usarán
+                this->arm_so_data = nullptr;
+                this->arm_so_length = 0;
+            }
         } else {
-            LOGE("Failed to get package name or app data directory.");
-            enable_hack = false; // No se puede proceder sin esta información.
+            LOGE("Failed to get package name. Dumper cannot be evaluated for this app.");
+            this->enable_hack = false;
         }
 
         if (current_package_name_utf) {
@@ -75,22 +151,20 @@ public:
         }
     }
 
-    void postAppSpecialize(const AppSpecializeArgs *) override {
+    void postAppSpecialize(const AppSpecializeArgs *args) override {
         if (enable_hack && game_data_dir) {
-            LOGI("Preparing hack for: %s", game_data_dir);
-            // Pasamos los datos del .so ARM si estamos en x86 y se mapearon correctamente.
+            LOGI("Hack is enabled for %s. Preparing hack in new thread.", game_data_dir);
             std::thread hack_thread(hack_prepare, game_data_dir, arm_so_data, arm_so_length);
             hack_thread.detach();
-            // Una vez pasados a hack_prepare, la responsabilidad de arm_so_data (munmap)
-            // recae en NativeBridgeLoad o el consumidor final.
+            // La responsabilidad de arm_so_data (munmap) se transfiere a hack_prepare/NativeBridgeLoad.
             // Anulamos los punteros aquí para indicar que la propiedad se ha transferido.
             arm_so_data = nullptr;
             arm_so_length = 0;
         } else {
-            LOGI("Hack not enabled or game_data_dir not set for this process.");
-            // Si arm_so_data fue mapeado pero el hack no se ejecutará, liberarlo.
+            LOGI("Hack not enabled or game_data_dir not set for this app (%s). Dumper inactive.", this->game_data_dir ? this->game_data_dir : "unknown data dir");
+            // Si arm_so_data fue mapeado pero el hack no se va a ejecutar (o falló en preApp), liberarlo.
             if (arm_so_data && arm_so_length > 0) {
-                LOGD("postAppSpecialize: munmap'ing arm_so_data because hack is not enabled.");
+                LOGD("postAppSpecialize: munmap'ing arm_so_data because hack is not proceeding.");
                 munmap(arm_so_data, arm_so_length);
                 arm_so_data = nullptr;
                 arm_so_length = 0;
@@ -100,85 +174,131 @@ public:
 
 private:
     Api *api;
-    JNIEnv *env;
+    JNIEnv *env; // Este JNIEnv es establecido en onLoad
     bool enable_hack;
-    char *game_data_dir; // Almacena el app_data_dir del proceso actual
-    void *arm_so_data;   // Datos mapeados del .so ARM auxiliar en x86
+    char *game_data_dir;
+    void *arm_so_data;
     size_t arm_so_length;
 
-    void processPreSpecialize(const char *current_package_name, const char *current_app_data_dir) {
-        LOGI("Zygisk Il2Cpp Dumper attempting to activate for package: %s", current_package_name);
-        // Por defecto, intentaremos activar el hack. hack_start verificará si existe libil2cpp.so
-        enable_hack = true;
-
-        // Gestionar game_data_dir
-        if (this->game_data_dir) {
-            delete[] this->game_data_dir;
+    // Nueva función helper para verificar la existencia de libil2cpp.so
+    bool hasIl2CppLibrary(const char* current_package_name_for_log) {
+        if (!this->env) { // Usar el JNIEnv almacenado en la instancia
+            LOGE("JNIEnv is null in MyModule::hasIl2CppLibrary for %s", current_package_name_for_log);
+            return false;
         }
-        size_t app_data_dir_len = strlen(current_app_data_dir);
-        this->game_data_dir = new char[app_data_dir_len + 1];
-        strcpy(this->game_data_dir, current_app_data_dir);
-        this->game_data_dir[app_data_dir_len] = '\0';
-        LOGI("Game data directory set to: %s", this->game_data_dir);
+        JNIEnv* current_jni_env = this->env;
 
-        // Lógica para cargar la librería .so ARM auxiliar en arquitecturas x86/x86_64
-#if defined(__i386__) || defined(__x86_64__)
-        const char* path = nullptr;
-#if defined(__i386__)
-        path = "zygisk/armeabi-v7a.so";
-        LOGI("Targeting armeabi-v7a helper for x86.");
-#elif defined(__x86_64__)
-        path = "zygisk/arm64-v8a.so";
-        LOGI("Targeting arm64-v8a helper for x86_64.");
-#endif
-        int dirfd = api->getModuleDir();
-        if (dirfd != -1) {
-            int fd = openat(dirfd, path, O_RDONLY);
-            if (fd != -1) {
-                struct stat sb{};
-                if (fstat(fd, &sb) == 0) {
-                    arm_so_length = sb.st_size;
-                    if (arm_so_length > 0) {
-                        arm_so_data = mmap(nullptr, arm_so_length, PROT_READ, MAP_PRIVATE, fd, 0);
-                        if (arm_so_data == MAP_FAILED) {
-                            LOGE("mmap failed for %s: %s", path, strerror(errno));
-                            arm_so_data = nullptr; // Asegurar que sea nulo si mmap falla
-                            arm_so_length = 0;
-                        } else {
-                            LOGI("Successfully mmap'd helper library %s, size %zu", path, arm_so_length);
-                        }
-                    } else {
-                        LOGW("Helper library %s is empty.", path);
-                        arm_so_data = nullptr;
-                        arm_so_length = 0;
-                    }
-                } else {
-                    LOGE("fstat failed for %s: %s", path, strerror(errno));
-                    arm_so_data = nullptr;
-                    arm_so_length = 0;
-                }
-                close(fd);
-            } else {
-                LOGW("Unable to open ARM helper library %s: %s", path, strerror(errno));
-                arm_so_data = nullptr;
-                arm_so_length = 0;
+        std::string native_lib_dir_str;
+
+        // --- Lógica JNI para obtener nativeLibraryDir ---
+        // Esta es una adaptación del código que tenías en GetLibDir y de la discusión
+        jclass activity_thread_clz = current_jni_env->FindClass("android/app/ActivityThread");
+        if (current_jni_env->ExceptionCheck()) { current_jni_env->ExceptionClear(); LOGE("JNI Exception during FindClass(ActivityThread) for %s", current_package_name_for_log); }
+        if (!activity_thread_clz) {
+            LOGE("hasIl2CppLibrary: ActivityThread class not found for %s", current_package_name_for_log);
+            return false;
+        }
+
+        jmethodID currentApplicationId = current_jni_env->GetStaticMethodID(activity_thread_clz, "currentApplication", "()Landroid/app/Application;");
+        if (current_jni_env->ExceptionCheck()) { current_jni_env->ExceptionClear(); LOGE("JNI Exception during GetStaticMethodID(currentApplication) for %s", current_package_name_for_log); }
+        current_jni_env->DeleteLocalRef(activity_thread_clz); // Limpiar ref de clase
+        if (!currentApplicationId) {
+            LOGE("hasIl2CppLibrary: currentApplication method ID not found for %s", current_package_name_for_log);
+            return false;
+        }
+
+        jobject application_obj = current_jni_env->CallStaticObjectMethod(activity_thread_clz, currentApplicationId);
+        if (current_jni_env->ExceptionCheck()) { current_jni_env->ExceptionClear(); LOGE("JNI Exception during CallStaticObjectMethod(currentApplication) for %s", current_package_name_for_log); }
+        if (!application_obj) {
+            LOGE("hasIl2CppLibrary: currentApplication() returned null for %s", current_package_name_for_log);
+            return false;
+        }
+
+        jclass application_clazz = current_jni_env->GetObjectClass(application_obj);
+        if (current_jni_env->ExceptionCheck()) { current_jni_env->ExceptionClear(); LOGE("JNI Exception during GetObjectClass(application_obj) for %s", current_package_name_for_log); }
+        if (!application_clazz) {
+            LOGE("hasIl2CppLibrary: Failed to get Application class for %s", current_package_name_for_log);
+            current_jni_env->DeleteLocalRef(application_obj);
+            return false;
+        }
+
+        jmethodID get_application_info_id = current_jni_env->GetMethodID(application_clazz, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
+        if (current_jni_env->ExceptionCheck()) { current_jni_env->ExceptionClear(); LOGE("JNI Exception during GetMethodID(getApplicationInfo) for %s", current_package_name_for_log); }
+        current_jni_env->DeleteLocalRef(application_clazz); // Limpiar ref de clase
+        if (!get_application_info_id) {
+            LOGE("hasIl2CppLibrary: getApplicationInfo method ID not found for %s", current_package_name_for_log);
+            current_jni_env->DeleteLocalRef(application_obj);
+            return false;
+        }
+
+        jobject application_info_obj = current_jni_env->CallObjectMethod(application_obj, get_application_info_id);
+        if (current_jni_env->ExceptionCheck()) { current_jni_env->ExceptionClear(); LOGE("JNI Exception during CallObjectMethod(getApplicationInfo) for %s", current_package_name_for_log); }
+        current_jni_env->DeleteLocalRef(application_obj); // Limpiar ref de objeto
+        if (!application_info_obj) {
+            LOGE("hasIl2CppLibrary: getApplicationInfo() returned null for %s", current_package_name_for_log);
+            return false;
+        }
+
+        jclass application_info_clazz = current_jni_env->GetObjectClass(application_info_obj);
+        if (current_jni_env->ExceptionCheck()) { current_jni_env->ExceptionClear(); LOGE("JNI Exception during GetObjectClass(application_info_obj) for %s", current_package_name_for_log); }
+        if (!application_info_clazz) {
+            LOGE("hasIl2CppLibrary: Failed to get ApplicationInfo class for %s", current_package_name_for_log);
+            current_jni_env->DeleteLocalRef(application_info_obj);
+            return false;
+        }
+
+        jfieldID native_library_dir_id = current_jni_env->GetFieldID(application_info_clazz, "nativeLibraryDir", "Ljava/lang/String;");
+        if (current_jni_env->ExceptionCheck()) { current_jni_env->ExceptionClear(); LOGE("JNI Exception during GetFieldID(nativeLibraryDir) for %s", current_package_name_for_log); }
+        current_jni_env->DeleteLocalRef(application_info_clazz); // Limpiar ref de clase
+        if (!native_library_dir_id) {
+            LOGE("hasIl2CppLibrary: nativeLibraryDir field ID not found for %s", current_package_name_for_log);
+            current_jni_env->DeleteLocalRef(application_info_obj);
+            return false;
+        }
+
+        jstring native_library_dir_jstring = (jstring) current_jni_env->GetObjectField(application_info_obj, native_library_dir_id);
+        if (current_jni_env->ExceptionCheck()) { current_jni_env->ExceptionClear(); LOGE("JNI Exception during GetObjectField(nativeLibraryDir) for %s", current_package_name_for_log); }
+        current_jni_env->DeleteLocalRef(application_info_obj); // Limpiar ref de objeto
+
+        if (native_library_dir_jstring) {
+            const char* path_utf = current_jni_env->GetStringUTFChars(native_library_dir_jstring, nullptr);
+            if (path_utf) {
+                native_lib_dir_str = path_utf;
+                current_jni_env->ReleaseStringUTFChars(native_library_dir_jstring, path_utf);
             }
-             // close(dirfd); // No cierres dirfd aquí, es propiedad de Zygisk
+            current_jni_env->DeleteLocalRef(native_library_dir_jstring);
         } else {
-            LOGE("Failed to get module directory descriptor.");
-            arm_so_data = nullptr;
-            arm_so_length = 0;
+            LOGI("hasIl2CppLibrary: nativeLibraryDir is a null jstring for %s.", current_package_name_for_log);
         }
-#else
-        // En ARM nativo, no necesitamos mapear un .so auxiliar aquí.
-        LOGI("Running on ARM architecture. No helper .so mmap needed in main module.");
-        arm_so_data = nullptr;
-        arm_so_length = 0;
-#endif
-        // Si algo falló al cargar el .so auxiliar en x86, `arm_so_data` será `nullptr`.
-        // `hack_prepare` y `NativeBridgeLoad` deben manejar esto.
-        // Si `enable_hack` se establece en `false` aquí debido a un error crítico,
-        // `postAppSpecialize` debería limpiar `arm_so_data` si fue mapeado.
+        // Limpiar cualquier excepción pendiente de la secuencia JNI.
+        if (current_jni_env->ExceptionCheck()) { current_jni_env->ExceptionClear(); }
+
+
+        if (native_lib_dir_str.empty()) {
+            LOGI("hasIl2CppLibrary: Native library directory path is empty for %s. Assuming libil2cpp.so is not present via this path.", current_package_name_for_log);
+            return false;
+        }
+        // --- Fin lógica JNI ---
+
+        std::string lib_to_check = "libil2cpp.so";
+        std::string full_lib_path = native_lib_dir_str + "/" + lib_to_check;
+
+        LOGI("hasIl2CppLibrary: For %s, checking for library at: %s", current_package_name_for_log, full_lib_path.c_str());
+        struct stat buffer;
+        if (stat(full_lib_path.c_str(), &buffer) == 0) {
+            // Verificar que sea un archivo regular y no un directorio (aunque dlopen se encargaría de eso)
+            if (S_ISREG(buffer.st_mode)) {
+                 LOGI("hasIl2CppLibrary: Found %s via stat at %s.", lib_to_check.c_str(), full_lib_path.c_str());
+                 return true;
+            } else {
+                 LOGW("hasIl2CppLibrary: Path %s exists but is not a regular file. Assuming %s not present correctly.", full_lib_path.c_str(), lib_to_check.c_str());
+                 return false;
+            }
+        } else {
+            LOGI("hasIl2CppLibrary: %s NOT found via stat for %s at %s (stat error: %s). Dumper will remain inactive.",
+                 lib_to_check.c_str(), current_package_name_for_log, full_lib_path.c_str(), strerror(errno));
+            return false;
+        }
     }
 };
 
