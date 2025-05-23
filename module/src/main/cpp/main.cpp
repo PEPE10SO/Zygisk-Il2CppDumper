@@ -8,7 +8,7 @@
 #include <cinttypes>
 #include <string> // Para std::string y strlen
 #include <cerrno> // Para strerror
-
+#include "xdl/xdl.h"
 #include "hack.h"
 #include "zygisk.hpp"
 // game.h ya no es necesario para GamePackageName, pero podría tener otras definiciones.
