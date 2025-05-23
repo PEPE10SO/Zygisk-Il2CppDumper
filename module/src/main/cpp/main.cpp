@@ -8,7 +8,7 @@
 #include <cinttypes>
 #include <string> // Para std::string y strlen
 #include <cerrno> // Para strerror
-#include "xdl.h"
+
 #include "hack.h"
 #include "zygisk.hpp"
 // game.h ya no es necesario para GamePackageName, pero podría tener otras definiciones.
@@ -107,27 +107,19 @@ private:
     size_t arm_so_length;
 
     void processPreSpecialize(const char *current_package_name, const char *current_app_data_dir) {
-    LOGI("Zygisk Il2Cpp Dumper attempting to activate for package: %s", current_package_name);
-    
-    // Comprobar si la librería existe antes de habilitar el hack
-    void *handle = xdl_open("libil2cpp.so", 0);
-    if (handle) {
-        enable_hack = true; // Solo habilitar si se encuentra la librería
-        xdl_close(handle);
-    } else {
-        LOGW("libil2cpp.so not found for package: %s. Hack will not be enabled.", current_package_name);
-        enable_hack = false; // Deshabilitar hack si la librería no está presente
-    }
+        LOGI("Zygisk Il2Cpp Dumper attempting to activate for package: %s", current_package_name);
+        // Por defecto, intentaremos activar el hack. hack_start verificará si existe libil2cpp.so
+        enable_hack = true;
 
-    // Gestionar game_data_dir
-    if (this->game_data_dir) {
-        delete[] this->game_data_dir;
-    }
-    size_t app_data_dir_len = strlen(current_app_data_dir);
-    this->game_data_dir = new char[app_data_dir_len + 1];
-    strcpy(this->game_data_dir, current_app_data_dir);
-    this->game_data_dir[app_data_dir_len] = '\0';
-    LOGI("Game data directory set to: %s", this->game_data_dir);
+        // Gestionar game_data_dir
+        if (this->game_data_dir) {
+            delete[] this->game_data_dir;
+        }
+        size_t app_data_dir_len = strlen(current_app_data_dir);
+        this->game_data_dir = new char[app_data_dir_len + 1];
+        strcpy(this->game_data_dir, current_app_data_dir);
+        this->game_data_dir[app_data_dir_len] = '\0';
+        LOGI("Game data directory set to: %s", this->game_data_dir);
 
         // Lógica para cargar la librería .so ARM auxiliar en arquitecturas x86/x86_64
 #if defined(__i386__) || defined(__x86_64__)
